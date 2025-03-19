@@ -1,76 +1,93 @@
 const express = require('express');
-const { Pool } = require('pg');
 const socketIo = require('socket.io');
 const http = require('http');
 const axios = require('axios');
 const dotenv = require('dotenv');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
 
 dotenv.config();
+
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
 app.use(express.json());
+app.use(cors());
 
-// Database connection (Supabase)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Upload photo to ImgBB
+console.log('SUPABASE_URL:', supabaseUrl);
+
+// Test Supabase connection
+async function testConnection() {
+  const { data, error } = await supabase.from('vehicles').select('id').limit(1);
+  if (error) {
+    console.error('Supabase Connection Error:', error);
+  } else {
+    console.log('Supabase Connected Successfully');
+  }
+}
+testConnection();
+
 const uploadPhoto = async (photoBase64, licensePlate) => {
-  const response = await axios.post('https://api.imgbb.com/1/upload', {
-    key: process.env.IMGBB_API_KEY,
-    image: photoBase64,
-    name: `${licensePlate}-${Date.now()}`,
-  }, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+  const base64Data = photoBase64.replace(/^data:image\/\w+;base64,/, '');
+  const params = new URLSearchParams();
+  params.append('key', process.env.IMGBB_API_KEY);
+  params.append('image', base64Data);
+  params.append('name', `${licensePlate}-${Date.now()}`);
+  params.append('expiration', '600');
+
+  const response = await axios.post('https://api.imgbb.com/1/upload', params, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
   return response.data.data.url;
 };
 
-// Vehicle entry
 app.post('/api/vehicle/entry', async (req, res) => {
+  console.log('Request Body:', req.body);
   const { license_plate, parking_location, photo_base64 } = req.body;
   const entry_time = new Date();
+
+  if (!photo_base64) {
+    return res.status(400).json({ error: 'photo_base64 is required' });
+  }
+
   try {
     const photo_url = await uploadPhoto(photo_base64, license_plate);
-    const result = await pool.query(
-      'INSERT INTO vehicles (license_plate, entry_time, parking_location, photo_url) VALUES ($1, $2, $3, $4) RETURNING *',
-      [license_plate, entry_time, JSON.stringify(parking_location), photo_url] // Store as JSON
-    );
-    res.json(result.rows[0]);
+    console.log('Photo URL:', photo_url);
+    const { data, error } = await supabase
+      .from('vehicles')
+      .insert([
+        {
+          license_plate,
+          entry_time,
+          parking_location,
+          photo_url,
+        },
+      ])
+      .select(); // Returns the inserted row
+    if (error) throw error;
+    console.log('Insert Result:', data[0]);
+    res.json(data[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error' });
+    console.error('Detailed Error:', err);
+    res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
-// Vehicle exit
-app.post('/api/vehicle/exit', async (req, res) => {
-  const { license_plate } = req.body;
-  const exit_time = new Date();
+// Optional: Retrieve all vehicles
+app.get('/api/vehicles', async (req, res) => {
   try {
-    const vehicle = await pool.query(
-      'UPDATE vehicles SET exit_time = $1 WHERE license_plate = $2 AND exit_time IS NULL RETURNING *',
-      [exit_time, license_plate]
-    );
-    if (vehicle.rows.length === 0) return res.status(404).json({ error: 'Vehicle not found' });
-
-    const entry_time = vehicle.rows[0].entry_time;
-    const diffMs = exit_time - entry_time;
-    const hours = diffMs / (1000 * 60 * 60);
-    const total_amount = hours <= 3.5 ? 10 : 10 + Math.ceil(hours - 3.5) * 10;
-
-    const result = await pool.query(
-      'UPDATE vehicles SET total_amount = $1 WHERE license_plate = $2 RETURNING *',
-      [total_amount, license_plate]
-    );
-
-    io.emit('vehicle_exit', result.rows[0]);
-    res.json(result.rows[0]);
+    const { data, error } = await supabase.from('vehicles').select('*');
+    if (error) throw error;
+    res.json(data);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error' });
+    console.error('Retrieve Error:', err);
+    res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
